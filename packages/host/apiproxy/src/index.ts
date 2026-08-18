@@ -16,7 +16,13 @@ import { Context, Service } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type {} from '@deepseek-ai/dsh-agent-default-model'
 import type { ApiProxy } from './api/index.ts'
-import { createApiProxy, DEFAULT_COLD_BLANK_PROBE_MAX_BYTES } from './api-proxy.ts'
+import {
+  createApiProxy,
+  DEFAULT_COLD_BLANK_PROBE_MAX_BYTES,
+  DEFAULT_HISTORY_PAGE_MAX_ENTRY_BYTES,
+  DEFAULT_HISTORY_PAGE_MAX_EVENTS,
+  DEFAULT_HISTORY_PAGE_MAX_RAW_EVENT_BYTES,
+} from './api-proxy.ts'
 import {
   DEFAULT_SESSION_LOG_COMPRESSION_LEVEL,
   type SessionLogCompressionLevel,
@@ -59,6 +65,12 @@ export interface Config {
    * @default 1024
    */
   coldBlankProbeMaxBytes?: number
+  /** Maximum raw events in one interactive history page. @default 128 */
+  historyPageMaxEvents?: number
+  /** Maximum serialized raw-event bytes in one interactive history page. @default 131072 */
+  historyPageMaxRawEventBytes?: number
+  /** Maximum serialized history-entry bytes in one interactive history page. @default 131072 */
+  historyPageMaxEntryBytes?: number
 }
 
 /**
@@ -77,6 +89,11 @@ export class ApiProxyService extends Service implements ApiProxy {
     sessionExportCompressionLevel: z.number().step(1).min(0).max(9)
       .default(DEFAULT_SESSION_LOG_COMPRESSION_LEVEL) as z<SessionLogCompressionLevel>,
     coldBlankProbeMaxBytes: z.natural().default(DEFAULT_COLD_BLANK_PROBE_MAX_BYTES),
+    historyPageMaxEvents: z.natural().min(1).max(2_048).default(DEFAULT_HISTORY_PAGE_MAX_EVENTS),
+    historyPageMaxRawEventBytes: z.natural().min(1_024).max(4 * 1024 * 1024)
+      .default(DEFAULT_HISTORY_PAGE_MAX_RAW_EVENT_BYTES),
+    historyPageMaxEntryBytes: z.natural().min(1_024).max(4 * 1024 * 1024)
+      .default(DEFAULT_HISTORY_PAGE_MAX_ENTRY_BYTES),
   })
 
   readonly sessions: ApiProxy['sessions']
@@ -106,6 +123,13 @@ export class ApiProxyService extends Service implements ApiProxy {
       ...(config.coldBlankProbeMaxBytes === undefined
         ? {}
         : { coldBlankProbeMaxBytes: config.coldBlankProbeMaxBytes }),
+      ...(config.historyPageMaxEvents === undefined ? {} : { historyPageMaxEvents: config.historyPageMaxEvents }),
+      ...(config.historyPageMaxRawEventBytes === undefined
+        ? {}
+        : { historyPageMaxRawEventBytes: config.historyPageMaxRawEventBytes }),
+      ...(config.historyPageMaxEntryBytes === undefined
+        ? {}
+        : { historyPageMaxEntryBytes: config.historyPageMaxEntryBytes }),
     })
     this.sessions = api.sessions
     this.subagents = api.subagents

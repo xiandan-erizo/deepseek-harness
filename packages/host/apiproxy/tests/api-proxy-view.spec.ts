@@ -324,6 +324,88 @@ describe('mux live view computation', () => {
     }
   })
 
+  it('bounds replay work at complete message-group boundaries', async () => {
+    const { ctx } = await harness()
+    const api = createApiProxy(ctx, {
+      defaultModelSelection: () => ({ provider: 'p', model: 'm' }),
+      cwd: '/tmp',
+      historyPageMaxEvents: 128,
+    })
+    const session = ctx.sessions.create()
+    ctx.agents.register({ id: session.id, session, status: 'idle', ctx } as Agent)
+    session.append('turn/start', { turn: 1 })
+    const groups = Array.from({ length: 3 }, (_unused, step) => {
+      const sources = Array.from({ length: 60 }, (_chunk, index) => session.append('assistant/chunk', {
+        turn: 1,
+        step: step + 1,
+        chunk: { type: 'text-delta', index, text: 'x' },
+      }).seq)
+      const message = session.append('assistant/message', {
+        turn: 1,
+        step: step + 1,
+        message: createMessage({
+          role: 'assistant',
+          content: [{ type: 'text', text: 'x'.repeat(sources.length) }],
+          source: { kind: 'model', provider: 'p', model: 'm' },
+        }),
+      }, { surfaceOp: 'append', sourceEventSeqs: sources })
+      return { sources, message }
+    })
+
+    const response = await api.sessions.history({
+      rpcId: RpcId('t-hist-bounded-replay'),
+      payload: { sessionId: session.id, maxMessages: 50 },
+    })
+    if (!response.result.ok) throw new Error('unreachable')
+    const page = response.result.value.events.map(entry => entry.event)
+    expect(page).toHaveLength(122)
+    expect(page[0]?.seq).toBe(groups[1]?.sources[0])
+    expect(page.at(-1)?.seq).toBe(groups[2]?.message.seq)
+    expect(response.result.value.hasMore).toBe(true)
+  })
+
+  it('bounds presenter views before serializing a history response', async () => {
+    const { ctx } = await harness()
+    ctx.tools.register(tool('large-view', {
+      presentResult: () => ({ card: 'terminal', output: 'v'.repeat(128 * 1024) }),
+    }))
+    const api = createApiProxy(ctx, {
+      defaultModelSelection: () => ({ provider: 'p', model: 'm' }),
+      cwd: '/tmp',
+      historyPageMaxEntryBytes: 128 * 1024,
+    })
+    const session = ctx.sessions.create()
+    ctx.agents.register({ id: session.id, session, status: 'idle', ctx } as Agent)
+    const first = appendUserText(session, 'first prompt')
+    session.append('tool/call', { turn: 1, step: 1, callId: CallId('large-view'), name: 'large-view', arguments: '{}' })
+    const result = session.append('tool/result', {
+      turn: 1,
+      step: 1,
+      message: createToolResultMessage({
+        callId: CallId('large-view'),
+        content: [{ type: 'text', text: 'small raw result' }],
+        isError: false,
+      }),
+    }, { surfaceOp: 'append' })
+    appendAssistantText(session, 'first reply', 1)
+    const second = appendUserText(session, 'second prompt')
+    const final = appendAssistantText(session, 'second reply', 2)
+
+    const response = await api.sessions.history({
+      rpcId: RpcId('t-hist-bounded-view'),
+      payload: { sessionId: session.id, maxMessages: 50 },
+    })
+    if (!response.result.ok) throw new Error('unreachable')
+    const page = response.result.value.events
+    expect(page[0]?.event.seq).toBe(first.seq)
+    expect(page.map(entry => entry.event.seq)).toContain(result.seq)
+    expect(page.map(entry => entry.event.seq)).toContain(second.seq)
+    expect(page.map(entry => entry.event.seq)).toContain(final.seq)
+    expect(page.find(entry => entry.event.seq === result.seq)?.view).toBeUndefined()
+    expect(response.result.value.hasMore).toBe(false)
+    expect(Buffer.byteLength(JSON.stringify(page), 'utf8')).toBeLessThanOrEqual(128 * 1024)
+  })
+
   it('drops a disposed session from the live open-call table (result after dispose gets no view)', async () => {
     const { ctx } = await harness()
     const api = createApiProxy(ctx, { defaultModelSelection: () => ({ provider: 'p', model: 'm' }), cwd: '/tmp' })

@@ -750,10 +750,16 @@ export interface Config {
    * @default 1024
    */
   coldBlankProbeMaxBytes?: number
+  /** Maximum raw events in one interactive history page. @default 128 */
+  historyPageMaxEvents?: number
+  /** Maximum serialized raw-event bytes in one interactive history page. @default 131072 */
+  historyPageMaxRawEventBytes?: number
+  /** Maximum serialized history-entry bytes in one interactive history page. @default 131072 */
+  historyPageMaxEntryBytes?: number
 }
 ```
 
-Source: [`packages/host/apiproxy/src/index.ts:41`](../packages/host/apiproxy/src/index.ts)
+Source: [`packages/host/apiproxy/src/index.ts:47`](../packages/host/apiproxy/src/index.ts)
 
 <a id="deepseek-aidsh-host-directory-picker-browse"></a>
 

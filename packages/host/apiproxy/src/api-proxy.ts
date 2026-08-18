@@ -112,6 +112,20 @@ import { canOpenNativePath, openNativePath, openNativeTextFile } from './native-
 /** Page size when history is called without maxMessages. */
 const DEFAULT_MAX_MESSAGES = 50
 
+/** Default replay safety limits for one interactive history page. */
+export const DEFAULT_HISTORY_PAGE_MAX_EVENTS = 128
+/** Default serialized raw-event budget for one interactive history page. */
+export const DEFAULT_HISTORY_PAGE_MAX_RAW_EVENT_BYTES = 128 * 1024
+/** Default serialized history-entry budget for one interactive history page. */
+export const DEFAULT_HISTORY_PAGE_MAX_ENTRY_BYTES = 128 * 1024
+
+/** Resolved replay budgets applied to each interactive history page. */
+interface HistoryPageLimits {
+  maxEvents: number
+  maxRawEventBytes: number
+  maxEntryBytes: number
+}
+
 /** Provider work budget: at most 100 calls and 2,000 inspected hits. */
 const SESSION_SEARCH_PROVIDER_CALL_LIMIT = 100
 
@@ -257,14 +271,15 @@ function paginate(
   events: readonly SessionEvent[],
   beforeSeq: number | undefined,
   maxMessages: number,
+  limits: HistoryPageLimits,
 ): { events: SessionEvent[]; hasMore: boolean } {
   const window = beforeSeq === undefined ? [...events] : events.filter(event => event.seq < beforeSeq)
+  const starts = messageGroupStarts(window)
   let count = 0
-  let cut = 0
+  let start = 0
   for (let i = window.length - 1; i >= 0; i--) {
     const event = window[i] as SessionEvent
     if (!MESSAGE_TYPES.has(event.type) || !isAppendSurfaceEvent(event)) continue
-    count++
     const sources = (event as { sourceEventSeqs?: number[] }).sourceEventSeqs
     let groupStart = event.seq
     if (sources !== undefined) {
@@ -272,13 +287,74 @@ function paginate(
         if (source < groupStart) groupStart = source
       }
     }
+    count++
     if (count >= maxMessages) {
-      cut = groupStart
+      start = window.findIndex(candidate => candidate.seq === groupStart)
+      if (start < 0) start = 0
       break
     }
   }
-  const page = window.filter(event => event.seq >= cut)
-  return { events: page, hasMore: cut > 0 }
+  for (const candidate of starts) {
+    if (candidate <= start || rawHistoryPageFits(window, start, limits)) break
+    start = candidate
+  }
+  return { events: window.slice(start), hasMore: start > 0 }
+}
+
+/** Indexes where a contiguous page can start without splitting a completed message group. */
+function messageGroupStarts(events: readonly SessionEvent[]): number[] {
+  const indexBySeq = new Map(events.map((event, index) => [event.seq, index]))
+  const starts = new Set<number>()
+  for (const event of events) {
+    if (!MESSAGE_TYPES.has(event.type) || !isAppendSurfaceEvent(event)) continue
+    const sources = (event as { sourceEventSeqs?: number[] }).sourceEventSeqs
+    let groupStart = event.seq
+    if (sources !== undefined) {
+      for (const source of sources) {
+        if (source < groupStart) groupStart = source
+      }
+    }
+    const index = indexBySeq.get(groupStart)
+    if (index !== undefined) starts.add(index)
+  }
+  return [...starts].sort((left, right) => left - right)
+}
+
+/** Whether the contiguous raw-event suffix beginning at start fits the replay budget. */
+function rawHistoryPageFits(events: readonly SessionEvent[], start: number, limits: HistoryPageLimits): boolean {
+  if (events.length - start > limits.maxEvents) return false
+  let bytes = 0
+  for (let i = start; i < events.length; i++) {
+    bytes += Buffer.byteLength(JSON.stringify(events[i]), 'utf8')
+    if (bytes > limits.maxRawEventBytes) return false
+  }
+  return true
+}
+
+/** Whether serialized history entries, including presenter views, fit one interactive response. */
+function historyEntryPageFits(entries: readonly HistoryEntry[], limits: HistoryPageLimits): boolean {
+  let bytes = 0
+  for (const entry of entries) {
+    bytes += Buffer.byteLength(JSON.stringify(entry), 'utf8')
+    if (bytes > limits.maxEntryBytes) return false
+  }
+  return true
+}
+
+/** Build one history entry, omitting an oversized derived view while preserving its durable event. */
+function historyEntry(
+  ctx: Context,
+  event: SessionEvent,
+  events: readonly SessionEvent[],
+  scope: ScopeKey | undefined,
+  limits: HistoryPageLimits,
+): HistoryEntry {
+  const view = viewFor(ctx, event, callId => backscanArgs(events, callId), scope)
+  if (view === undefined) return { event }
+  const entry = { event, view }
+  return Buffer.byteLength(JSON.stringify(entry), 'utf8') <= limits.maxEntryBytes
+    ? entry
+    : { event }
 }
 
 /** Wrap an ok result echoing the request's rpcId. */
@@ -628,6 +704,12 @@ export interface ApiProxyDefaults {
   sessionExportCompressionLevel?: SessionLogCompressionLevel
   /** Maximum artifact size eligible for one cold blankness read. */
   coldBlankProbeMaxBytes?: number
+  /** Maximum raw events returned in one history page. */
+  historyPageMaxEvents?: number
+  /** Maximum serialized raw-event bytes returned in one history page. */
+  historyPageMaxRawEventBytes?: number
+  /** Maximum serialized history-entry bytes returned in one history page. */
+  historyPageMaxEntryBytes?: number
   /**
    * Whether handing a path to the native opener can work at all — the
    * `hasDocument` capability the preset roster reports, and the switch
@@ -776,15 +858,19 @@ function historyPage(
   events: readonly SessionEvent[],
   beforeSeq: number | undefined,
   maxMessages: number | undefined,
+  limits: HistoryPageLimits,
   scope?: ScopeKey,
 ): { events: HistoryEntry[]; hasMore: boolean } {
-  const page = paginate(events, beforeSeq, maxMessages ?? DEFAULT_MAX_MESSAGES)
-  return {
-    events: page.events.map((event) => {
-      const view = viewFor(ctx, event, callId => backscanArgs(page.events, callId), scope)
-      return { event, ...view === undefined ? {} : { view } }
-    }),
-    hasMore: page.hasMore,
+  const page = paginate(events, beforeSeq, maxMessages ?? DEFAULT_MAX_MESSAGES, limits)
+  const starts = messageGroupStarts(page.events)
+  let start = 0
+  for (;;) {
+    const pageEvents = page.events.slice(start)
+    const entries = pageEvents.map(event => historyEntry(ctx, event, pageEvents, scope, limits))
+    if (historyEntryPageFits(entries, limits)) return { events: entries, hasMore: page.hasMore || start > 0 }
+    const nextStart = starts.find(candidate => candidate > start)
+    if (nextStart === undefined) return { events: entries, hasMore: page.hasMore || start > 0 }
+    start = nextStart
   }
 }
 
@@ -1077,6 +1163,11 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
     ?? DEFAULT_SESSION_LOG_COMPRESSION_LEVEL
   const coldBlankProbeMaxBytes = defaults.coldBlankProbeMaxBytes
     ?? DEFAULT_COLD_BLANK_PROBE_MAX_BYTES
+  const historyPageLimits: HistoryPageLimits = {
+    maxEvents: defaults.historyPageMaxEvents ?? DEFAULT_HISTORY_PAGE_MAX_EVENTS,
+    maxRawEventBytes: defaults.historyPageMaxRawEventBytes ?? DEFAULT_HISTORY_PAGE_MAX_RAW_EVENT_BYTES,
+    maxEntryBytes: defaults.historyPageMaxEntryBytes ?? DEFAULT_HISTORY_PAGE_MAX_ENTRY_BYTES,
+  }
   /** The seed model each create/resume declares; re-read so it never goes stale. */
   const agentOptions = (): AgentOptions => {
     const { provider, model } = defaults.defaultModelSelection()
@@ -2191,7 +2282,7 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
           // at N with a baseline folded to N+1.
           const scope = await presenterScopeFor(sessionId, sourceSession(source))
           const cut = historyCutOf(source, beforeSeq === undefined)
-          const page = historyPage(ctx, cut.events, beforeSeq, maxMessages, scope)
+          const page = historyPage(ctx, cut.events, beforeSeq, maxMessages, historyPageLimits, scope)
           return ok(request, {
             events: page.events,
             hasMore: page.hasMore,
@@ -2670,7 +2761,7 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
             details: { childSessionId },
           })
         }
-        const page = historyPage(ctx, events, beforeSeq, maxMessages)
+        const page = historyPage(ctx, events, beforeSeq, maxMessages, historyPageLimits)
         return ok(request, { ...page, ...projections === undefined ? {} : { projections } })
       },
 
