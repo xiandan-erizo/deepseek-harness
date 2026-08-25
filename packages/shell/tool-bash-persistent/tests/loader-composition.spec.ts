@@ -152,6 +152,12 @@ suite('persistent Bash through a real cordis.yml Loader composition', () => {
     ))
     expect(heredoc).toBe('alpha\nbeta')
 
+    const literalBang = text(await execute(
+      'literal-bang',
+      "printf '%s\\n' ready # !ok",
+    ))
+    expect(literalBang).toBe('ready')
+
     const large = text(await execute('large-output', 'seq 1 12050'))
     expect(large.startsWith('1\n2\n3\n')).toBe(true)
     expect(large).toContain('<response clipped>')
